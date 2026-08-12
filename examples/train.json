@@ -1,0 +1,6 @@
+{
+  "systems": "datasets/train/foundation_5000.jsonl",
+  "output": "outputs/foundation.eqx",
+  "steps": 1000,
+  "n_max": 64
+}

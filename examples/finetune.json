@@ -1,0 +1,6 @@
+{
+  "system": "datasets/eval/ppp_ohno_n256.json",
+  "checkpoint": "weights/hamiltonzero_v1.eqx",
+  "output": "outputs/ppp_ohno_n256.eqx",
+  "steps": 1000
+}

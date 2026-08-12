@@ -1,0 +1,385 @@
+# Modifications copyright (c) 2026 Simulacra Research Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Copyright 2022 DeepMind Technologies Limited. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""K-FAC JAX staging utilities."""
+
+import functools
+import inspect
+import operator
+from typing import Any, Callable, Sequence
+
+import jax
+from jax import lax
+import jax.numpy as jnp
+
+from kfac_jax._src.utils import misc
+from kfac_jax._src.utils import parallel
+from kfac_jax._src.utils import types
+
+
+TArrayTree = types.TArrayTree
+
+
+class WithStagedMethods(misc.Finalizable):
+  """An mixin for classes which can have staged/compiled methods."""
+
+  class StagingContext:
+    """A context manager for handling methods that are staged/compiled."""
+
+    def __init__(self, wsm_instance: "WithStagedMethods"):
+      """Initializes the context manager.
+
+      Args:
+        wsm_instance: The corresponding `WithStagedMethods` instance.
+      """
+      self._wsm_instance = wsm_instance
+
+    def __enter__(self):
+      """Enters the staging context."""
+      if self._wsm_instance._in_staging:
+        raise RuntimeError("Cannot enter staging context while already in "
+                           "staging context.")
+      self._wsm_instance._in_staging = True
+
+    def __exit__(self, *_):
+      """Exits the staging context."""
+      assert self._wsm_instance._in_staging, "Exiting while not in staging."
+      self._wsm_instance._in_staging = False
+
+  def __init__(
+      self,
+      multi_device: bool = False,
+      pmap_axis_name: str | None = None,
+      debug: bool = False,
+      **parent_kwargs: Any,
+  ):
+    """Initializes the instance.
+
+    Args:
+      multi_device: Whether any of decorated staged methods are to be run on a
+        single or multiple devices. If this is set to `True` than any call
+        would internally be delegated to `jax.pmap` and otherwise to  `jax.jit`.
+      pmap_axis_name: The name of the pmap axis to use when running on
+        multiple devices. This is required if `multi_device=True`.
+      debug: If this is set `True` than any call to a stage method would
+        directly call the method and would not stage/compile it.
+      **parent_kwargs: Any additional keyword arguments for the parent class.
+    """
+    if "excluded_attribute_names" in parent_kwargs:
+      parent_kwargs["excluded_attribute_names"] = (
+          ("_in_staging",) + tuple(parent_kwargs["excluded_attribute_names"]))
+    else:
+      parent_kwargs["excluded_attribute_names"] = ("_in_staging",)
+
+    super().__init__(**parent_kwargs)
+
+    def _valid_axis_name(name):
+      return (
+          isinstance(name, str)
+          or (
+              isinstance(name, tuple)
+              and len(name) > 0
+              and all(isinstance(axis, str) for axis in name)
+          )
+      )
+
+    if multi_device and not _valid_axis_name(pmap_axis_name):
+      raise ValueError(
+          "When `multi_device=True` you must pass a string axis name or "
+          "a tuple of string axis names for `pmap_axis_name`."
+      )
+
+    self._multi_device = multi_device
+    self._pmap_axis_name = pmap_axis_name
+    self._debug = debug
+    self._in_staging = False
+
+  @property
+  def multi_device(self) -> bool:
+    """Indicates whether staged method will be run across multiple devices."""
+    return self._multi_device
+
+  @property
+  def pmap_axis_name(self):
+    """The name of the `jax.pmap` axis to use for staged methods."""
+    if self.debug:
+      return None
+    return self._pmap_axis_name
+
+  @property
+  def debug(self) -> bool:
+    """Whether staged methods would be run in 'debug' mode."""
+    return self._debug
+
+  @property
+  def in_staging(self) -> bool:
+    """Whether we are in a staging context while compiling staged methods."""
+    return self._in_staging
+
+  def staging_context(self) -> StagingContext:
+    """Returns a staging context manager, linked to this instance."""
+    return self.StagingContext(self)
+
+  def get_first(self, obj: TArrayTree) -> TArrayTree:
+    """Indexes the `obj` PyTree leaves over leading axis if `multi_device`."""
+    return parallel.get_first(obj) if self.multi_device else obj
+
+  def copy_obj(self, obj: TArrayTree | None) -> TArrayTree | None:
+    """Copies the object."""
+    if self.multi_device:
+      return parallel.pmap_copy_obj(obj)
+    else:
+      return parallel.copy_obj(obj)
+
+  def replicate(self, obj: TArrayTree) -> TArrayTree:
+    """Replicates the object to all local devices if `multi_device`."""
+    if self.multi_device:
+      return parallel.replicate_all_local_devices(obj)
+    else:
+      return obj
+
+  def pmean_if_pmap_wrapper(
+      self,
+      func: Callable[..., TArrayTree],
+  ) -> Callable[..., TArrayTree]:
+    """Wraps a function to perform a pmean if `multi_device`."""
+    if self.multi_device and not self.debug:
+      return lambda *args, **kwargs: lax.pmean(
+          func(*args, **kwargs), self.pmap_axis_name
+      )
+    else:
+      return func
+
+
+def staged(
+    method: Callable[..., TArrayTree],
+    static_argnums: int | Sequence[int] | None = None,
+    donate_argnums: int | Sequence[int] | None = None,
+) -> Callable[..., TArrayTree]:
+  """Makes the instance method staged.
+
+  This decorator **should** only be applied to instance methods of classes that
+  inherit from the `WithStagedMethods` class. The decorator makes the decorated
+  method staged, which is equivalent to `jax.jit` if `instance.multi_device` is
+  `False` and to `jax.pmap` otherwise.
+
+  Note that the point of this abstraction around JAX's compilation is to make
+  sure that jitting/pmapping is only done once, so that if we are already in a
+  compiled/staged method, we won't initiate a second nested compilation when
+  calling into second staged method.
+
+  Note that when specifying static and donated argunms, the `self` reference
+  **must not** be counted. Example:
+
+    @functools.partial(staged, donate_argunms=0)
+    def try(self, x):
+      ...
+
+    then `instance.try(x)` is equivalent to
+    `jax.jit(instance.try, donate_argnums=0)(x)` if `instance.multi_device` is
+    `False` and to `jax.pmap(instance.try, donate_argnums=0)(x)` otherwise.
+
+  Args:
+    method: The method to be transformed into a staged method.
+    static_argnums: The static argument numbers, as defined in `jax.jit/pmap`.
+    donate_argnums: The donated argument numbers, as defined in
+      `jax.jit/pmap`.
+
+  Returns:
+    The transformed method, which will now be a staged function.
+  """
+
+  if isinstance(static_argnums, int):
+    static_argnums = (static_argnums,)
+
+  # This is needed because of b/147015762
+  if donate_argnums is None:
+    donate_argnums = ()
+  if isinstance(donate_argnums, int):
+    donate_argnums = (donate_argnums,)
+  else:
+    donate_argnums: tuple[int, ...] = tuple(donate_argnums)
+
+  original_static_argnums = static_argnums or ()
+
+  # shift static_argnums by 1 and include instance (self)
+  static_argnums = (0,) + tuple(i + 1 for i in (static_argnums or ()))
+  # shift donate_argnums by 1 and include state
+  donate_argnums = tuple(i + 1 for i in donate_argnums)
+
+  pmap_funcs = {}
+  jitted_func = jax.jit(method,
+                        static_argnums=static_argnums,
+                        donate_argnums=donate_argnums)
+
+  @functools.wraps(method)
+  def decorated(
+      instance: "WithStagedMethods",
+      *args: Any,
+      **kwargs: Any
+  ) -> TArrayTree:
+
+    sig = inspect.signature(method)
+    bound_args = sig.bind(instance, *args, **kwargs)
+    bound_args.apply_defaults()
+    args, kwargs = bound_args.args[1:], bound_args.kwargs
+
+    if instance.in_staging:
+      return method(instance, *args, **kwargs)
+
+    with instance.staging_context():
+
+      if instance.multi_device and instance.debug:
+        # In this case we want to call `method` once for each device index.
+        # Note that this might not always produce sensible behavior, and will
+        # depend on the details of the method and if it has side effects on the
+        # state of the class. Note that pmean operations won't happen, since the
+        # actual output of pmapped methods won't be numerically correct.
+
+        bcast_argnums = [
+            i for i in range(len(args)) if (i in original_static_argnums
+                                            or parallel.is_scalar(args[i]))]
+
+        outs = []
+        non_bcast_args = [args[i] if i not in bcast_argnums else None
+                          for i in range(len(args))]
+
+        for i in range(jax.local_device_count()):
+
+          non_bcast_args_i = jax.tree_util.tree_map(
+              operator.itemgetter(i), non_bcast_args)
+
+          args_i = [
+              non_bcast_args_i[j] if j not in bcast_argnums else args[j]
+              for j in range(len(args))
+          ]
+
+          kwargs_i = jax.tree_util.tree_map(operator.itemgetter(i), kwargs)
+
+          with jax.disable_jit():
+            outs.append(method(instance, *args_i, **kwargs_i))
+
+        outs = jax.tree_util.tree_map(lambda *args_: jnp.stack(args_), *outs)
+
+      elif instance.debug:
+        with jax.disable_jit():
+          outs = method(instance, *args, **kwargs)
+
+      elif instance.multi_device:
+
+        # shard_map handles the parallelism (consumes NamedSharded inputs
+        # natively, with no
+        # device_put_replicated/all-to-all boilerplate); jit handles
+        # caching and donation (buffer reuse for opt state — critical to
+        # avoid per-step state all-to-all).
+        from jax.sharding import (
+            Mesh as _Mesh, NamedSharding as _NS,
+            PartitionSpec as _P,
+            SingleDeviceSharding as _SDS,
+        )
+
+        static_idx = set(original_static_argnums)
+        dynamic_idx = [i for i in range(len(args)) if i not in static_idx]
+        # `donate_argnums` (outer closure) has already been shifted +1
+        # for instance/self at line ~206. Un-shift to recover the
+        # user-supplied indices over `args` (excluding self), then map
+        # to dynamic-only positions (jit donate_argnums positional).
+        _orig_donate = tuple(i - 1 for i in donate_argnums if i >= 1)
+        donate_dynamic = tuple(
+            dynamic_idx.index(i) for i in _orig_donate if i in dynamic_idx
+        )
+
+        axis_names = instance.pmap_axis_name
+        axis_names = axis_names if isinstance(axis_names, tuple) else (axis_names,)
+
+        def _spec_for(leaf):
+          if parallel.is_scalar(leaf):
+            return _P()
+          sh = getattr(leaf, "sharding", None)
+          if isinstance(sh, _NS):
+            return sh.spec
+          if isinstance(sh, _SDS):
+            return _P()
+          return _P()
+
+        def _mesh_from_dynamic_args(dynamic_args_):
+          for leaf in jax.tree_util.tree_leaves(dynamic_args_):
+            sh = getattr(leaf, "sharding", None)
+            if isinstance(sh, _NS):
+              mesh_ = sh.mesh
+              if all(axis in mesh_.axis_names for axis in axis_names):
+                return mesh_
+          if len(axis_names) == 1:
+            return _Mesh(jax.local_devices(), axis_names)
+          raise ValueError(
+              "multi-axis KFAC staging needs at least one NamedSharded "
+              f"dynamic argument on a mesh containing axes {axis_names!r}"
+          )
+
+        # `args` order signature is fixed; cache by static-arg values
+        # plus dynamic-arg shardings (per-leaf shapes/dtypes are
+        # handled by jit's own cache).
+        dynamic_args = tuple(args[i] for i in dynamic_idx)
+        mesh = _mesh_from_dynamic_args(dynamic_args)
+        in_specs = tuple(
+            jax.tree_util.tree_map(_spec_for, a) for a in dynamic_args
+        )
+        cache_key = (
+            instance.pmap_axis_name,
+            tuple(mesh.axis_names),
+            tuple(mesh.shape.items()),
+            tuple((i, args[i]) for i in sorted(static_idx)),
+            str(in_specs),
+        )
+        func = pmap_funcs.get(cache_key)
+        if func is None:
+          # Closure-capture instance + static args; the inner function
+          # only takes dynamic args (so jit's static_argnums isn't
+          # needed — the static values are baked into the closure).
+          static_kv = {i: args[i] for i in static_idx}
+
+          def _bound_method(*dyn_args,
+                            _instance=instance,
+                            _static_kv=static_kv,
+                            _kwargs=kwargs,
+                            _n=len(args)):
+            full = []
+            di = 0
+            for i in range(_n):
+              if i in static_idx:
+                full.append(_static_kv[i])
+              else:
+                full.append(dyn_args[di])
+                di += 1
+            return method(_instance, *full, **_kwargs)
+
+          sharded = jax.shard_map(
+              _bound_method, mesh=mesh,
+              in_specs=in_specs, out_specs=_P(),
+              check_vma=False,
+          )
+          func = jax.jit(sharded, donate_argnums=donate_dynamic)
+
+          pmap_funcs[cache_key] = func
+
+        outs = func(*dynamic_args)
+
+      else:
+        outs = jitted_func(instance, *args, **kwargs)
+
+    return outs
+
+  return decorated

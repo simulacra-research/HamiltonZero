@@ -1,0 +1,5 @@
+{
+  "system": "datasets/eval/j1j2_45x45_obc.json",
+  "checkpoint": "weights/hamiltonzero_v1.eqx",
+  "output": "outputs/j1j2_45x45_eval"
+}

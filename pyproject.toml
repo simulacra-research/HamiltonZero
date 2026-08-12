@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hamiltonzero"
+version = "0.1.0"
+description = "Compiled neural wavefunctions for quantum spin systems"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0 AND MIT"
+license-files = [
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
+    "third_party/folx/LICENSE",
+    "third_party/jax/LICENSE",
+    "third_party/kfac_jax/LICENSE",
+]
+dependencies = [
+    "absl-py>=2.5",
+    "distrax>=0.1.9",
+    "dm-tree>=0.1.10",
+    "equinox==0.13.6",
+    "immutabledict>=4.3",
+    "jax @ git+https://github.com/TakeOver/jax.git@79f82535b15a444516d4a5e2beb71d283665b2ff",
+    "jaxlib==0.11.0",
+    "jaxtyping==0.3.9",
+    "networkx>=3.5",
+    "numpy>=2.3",
+    "optax>=0.2.8",
+    "packaging>=26",
+    "typing-extensions>=4.15",
+]
+
+[project.optional-dependencies]
+notebooks = [
+    "jupyterlab>=4.4",
+    "matplotlib>=3.10",
+]
+
+[project.scripts]
+hamiltonzero = "hamiltonzero.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["hamiltonzero*", "kfac_jax*"]
