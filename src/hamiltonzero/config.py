@@ -151,6 +151,7 @@ class TrainConfig:
     steps: int
     seed: int = 777
     n_max: int = 64
+    checkpoint: Path | None = None
     model: ModelConfig = field(default_factory=ModelConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
     mcmc: MCMCConfig = field(default_factory=MCMCConfig)

@@ -224,7 +224,11 @@ The example uses `datasets/train/foundation_5000.jsonl`, writes
 parameters through JSON. The command writes the trained model at the end of
 the run.
 
-To skip burn-in using compatible post-burn-in sampler states:
+Set the optional top-level `checkpoint` field to start from a full router-model
+checkpoint. This loads model parameters only; KFAC state, sampler state, the
+step counter, and the learning-rate schedule start fresh.
+
+To load compatible sampler states:
 
 ```bash
 hamiltonzero train examples/train.json --reuse-mcmc path/to/mcmc-states
@@ -232,7 +236,9 @@ hamiltonzero train examples/train.json --reuse-mcmc path/to/mcmc-states
 
 For multisystem training, the path is a directory containing
 `<system-index>.eqx` files. For a one-system training panel it may be a single
-file.
+file. Training runs `mcmc.burn_in` iterations after either fresh initialization
+or loading reused states. Each iteration uses `mcmc.burn_in_replica_steps`
+MCMC moves.
 
 ## Fine-tune
 

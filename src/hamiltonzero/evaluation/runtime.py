@@ -40,6 +40,7 @@ from hamiltonzero.data.systems import (
     load_system as load_spin_hamiltonian,
 )
 from hamiltonzero.energy import vmc_energy_custom_lap_compiled
+from hamiltonzero.energy.custom_lap import build_W_levels
 from hamiltonzero.energy.frame import compile_energy_frame, route_energy_inputs
 from hamiltonzero.mcmc.runtime import (
     adapt_batched,
@@ -212,7 +213,6 @@ def _step_single(
     )
 
 
-@partial(jax.jit, static_argnames=("replica_steps", "walker_chunk_size"))
 def _step_compiled_rows(
     state,
     model,
@@ -249,7 +249,6 @@ def _adapt_single(
     )
 
 
-@jax.jit
 def _adapt_rows(
     state,
     beta_history_weight,
@@ -269,27 +268,110 @@ def _adapt_rows(
 
 
 def _compiled_energy_single(kernel, tree, frame, q, *, chunk_size: int):
-    values = vmc_energy_custom_lap_compiled(
+    return vmc_energy_custom_lap_compiled(
         kernel,
         tree,
         frame,
         q,
         chunk_size=chunk_size,
     )
-    return tuple(jnp.expand_dims(value, axis=0) for value in values)
 
 
-@partial(jax.jit, static_argnames=("chunk_size",))
+def _build_compiled_energy_single(mesh: Mesh, chunk_size: int):
+    batch = P("batch", None, None)
+    batch_output = P("batch")
+
+    def local_energy(kernel, tree, frame, q):
+        outputs = _compiled_energy_single(
+            kernel,
+            tree,
+            frame,
+            q,
+            chunk_size=int(chunk_size),
+        )
+        local_count = jnp.asarray(q.shape[0], dtype=jnp.int32)
+        global_count = jax.lax.psum(local_count, "batch")
+        guard = global_count.astype(jnp.float32) * jnp.asarray(0.0, jnp.float32)
+        return tuple(value + guard.astype(value.dtype) for value in outputs)
+
+    mapped = jax.shard_map(
+        local_energy,
+        mesh=mesh,
+        in_specs=(P(), P(), P(), batch),
+        out_specs=(batch_output,) * 4,
+        check_vma=False,
+    )
+    replicated_sharding = NamedSharding(mesh, P())
+    batch_sharding = NamedSharding(mesh, batch)
+    batch_output_sharding = NamedSharding(mesh, batch_output)
+    return jax.jit(
+        mapped,
+        in_shardings=(
+            replicated_sharding,
+            replicated_sharding,
+            replicated_sharding,
+            batch_sharding,
+        ),
+        out_shardings=(batch_output_sharding,) * 4,
+    )
+
+
 def _compiled_energy_rows(kernel, trees, frames, q, *, chunk_size: int):
-    return jax.vmap(
-        lambda tree, frame, q_row: vmc_energy_custom_lap_compiled(
+    def energy_row(tree, frame, q_row):
+        n_sites = int(q_row.shape[-2])
+        frame = eqx.tree_at(
+            lambda value: value.w_levels,
+            frame,
+            tuple(build_W_levels(frame.custom_lap_J_eff, n_sites)),
+        )
+        return vmc_energy_custom_lap_compiled(
             kernel,
             tree,
             frame,
             q_row,
             chunk_size=chunk_size,
         )
-    )(trees, frames, q)
+
+    return jax.vmap(energy_row)(trees, frames, q)
+
+
+def _build_compiled_energy_rows(mesh: Mesh, chunk_size: int):
+    systems = P("systems")
+    system_batch = P("systems", None)
+
+    def local_energy(kernel, trees, frames, q):
+        outputs = _compiled_energy_rows(
+            kernel,
+            trees,
+            frames,
+            q,
+            chunk_size=int(chunk_size),
+        )
+        local_count = jnp.asarray(q.shape[0] * q.shape[1], dtype=jnp.int32)
+        global_count = jax.lax.psum(local_count, "systems")
+        guard = global_count.astype(jnp.float32) * jnp.asarray(0.0, jnp.float32)
+        return tuple(value + guard.astype(value.dtype) for value in outputs)
+
+    mapped = jax.shard_map(
+        local_energy,
+        mesh=mesh,
+        in_specs=(P(), systems, systems, system_batch),
+        out_specs=(system_batch,) * 4,
+        check_vma=False,
+    )
+    replicated_sharding = NamedSharding(mesh, P())
+    systems_sharding = NamedSharding(mesh, systems)
+    system_batch_sharding = NamedSharding(mesh, system_batch)
+    return jax.jit(
+        mapped,
+        in_shardings=(
+            replicated_sharding,
+            systems_sharding,
+            systems_sharding,
+            system_batch_sharding,
+        ),
+        out_shardings=(system_batch_sharding,) * 4,
+    )
 
 
 _compile_single = jax.jit(compile_wavefunction)
@@ -332,6 +414,131 @@ def _single_state_sharding(mesh: Mesh, state):
         m=replicated,
         n_haar_accept=walkers,
         n_haar=walkers,
+    )
+
+
+def _single_state_specs(state):
+    walkers = P("batch")
+    replicated = P()
+    return type(state)(
+        q=walkers,
+        log_p=walkers,
+        grad_log_p=walkers,
+        beta=replicated,
+        sigma=replicated,
+        step=replicated,
+        key=walkers,
+        n_local_accept=walkers,
+        n_local=walkers,
+        n_swap_accept=walkers,
+        n_swap=walkers,
+        mask=replicated,
+        m=replicated,
+        n_haar_accept=walkers,
+        n_haar=walkers,
+    )
+
+
+def _row_state_specs(state):
+    systems = P("systems")
+    return jax.tree_util.tree_map(lambda _value: systems, state)
+
+
+def _row_model_specs(model):
+    return CompiledWaveFunctions(
+        kernel=jax.tree_util.tree_map(lambda _value: P(), model.kernel),
+        trees=jax.tree_util.tree_map(lambda _value: P("systems"), model.trees),
+    )
+
+
+def _row_model_sharding(mesh: Mesh, model):
+    return CompiledWaveFunctions(
+        kernel=_replicated_sharding(mesh, model.kernel),
+        trees=_system_sharding(mesh, model.trees),
+    )
+
+
+def _build_rows_mcmc_step(
+    mesh: Mesh,
+    state,
+    model,
+    context,
+    *,
+    replica_steps: int,
+    walker_chunk_size: int,
+):
+    state_specs = _row_state_specs(state)
+    model_specs = _row_model_specs(model)
+    context_specs = jax.tree_util.tree_map(lambda _value: P("systems"), context)
+    state_sharding = _system_sharding(mesh, state)
+    model_sharding = _row_model_sharding(mesh, model)
+    context_sharding = _system_sharding(mesh, context)
+
+    def local_step(state_local, model_local, context_local):
+        out = _step_compiled_rows(
+            state_local,
+            model_local,
+            context_local,
+            replica_steps=int(replica_steps),
+            walker_chunk_size=int(walker_chunk_size),
+        )
+        local_count = jnp.asarray(out.q.shape[0] * out.q.shape[1], dtype=jnp.int32)
+        global_count = jax.lax.psum(local_count, "systems")
+        guard = global_count.astype(out.q.dtype) * jnp.asarray(0.0, out.q.dtype)
+        return eqx.tree_at(lambda value: value.q, out, out.q + guard)
+
+    mapped = jax.shard_map(
+        local_step,
+        mesh=mesh,
+        in_specs=(state_specs, model_specs, context_specs),
+        out_specs=state_specs,
+        check_vma=False,
+    )
+    return jax.jit(
+        mapped,
+        in_shardings=(state_sharding, model_sharding, context_sharding),
+        out_shardings=state_sharding,
+        donate_argnums=(0,),
+    )
+
+
+def _build_singular_mcmc_step(
+    mesh: Mesh,
+    state,
+    state_sharding,
+    model_sharding,
+    context_sharding,
+    *,
+    replica_steps: int,
+    walker_chunk_size: int,
+):
+    state_specs = _single_state_specs(state)
+
+    def local_step(state_local, model_local, context_local):
+        out = _step_single(
+            state_local,
+            model_local,
+            context_local,
+            replica_steps=int(replica_steps),
+            walker_chunk_size=int(walker_chunk_size),
+        )
+        local_count = jnp.asarray(out.q.shape[0], dtype=jnp.int32)
+        global_count = jax.lax.psum(local_count, "batch")
+        guard = global_count.astype(out.q.dtype) * jnp.asarray(0.0, out.q.dtype)
+        return eqx.tree_at(lambda value: value.q, out, out.q + guard)
+
+    mapped = jax.shard_map(
+        local_step,
+        mesh=mesh,
+        in_specs=(state_specs, P(), P()),
+        out_specs=state_specs,
+        check_vma=False,
+    )
+    return jax.jit(
+        mapped,
+        in_shardings=(state_sharding, model_sharding, context_sharding),
+        out_shardings=state_sharding,
+        donate_argnums=(0,),
     )
 
 
@@ -440,6 +647,8 @@ class DefaultEvalBackend:
         self._energy_frames: dict[int, Any] = {}
         self._context_meshes: dict[int, Mesh] = {}
         self._contest_mesh: Mesh | None = None
+        self._contest_step_entries: dict[tuple[int, int], Any] = {}
+        self._contest_adapt_entry: Any | None = None
         self._singular_mesh: Mesh | None = None
         self._singular_state_sharding: Any | None = None
         self._singular_model_sharding: Any | None = None
@@ -447,6 +656,7 @@ class DefaultEvalBackend:
         self._singular_step_entries: dict[tuple[int, int], Any] = {}
         self._singular_adapt_entry: Any | None = None
         self._singular_energy_entries: dict[int, Any] = {}
+        self._contest_energy_entries: dict[int, Any] = {}
 
     def build_system(self, system, energy: EnergyConfig):
         context, energy_inputs = build_context_and_energy(
@@ -598,6 +808,9 @@ class DefaultEvalBackend:
         self._energy_frames[id(routed)] = frames
         self._context_meshes[id(routed)] = mesh
         self._contest_mesh = mesh
+        self._contest_step_entries.clear()
+        self._contest_adapt_entry = None
+        self._contest_energy_entries.clear()
         return routed
 
     def release_context(self, context) -> None:
@@ -605,6 +818,9 @@ class DefaultEvalBackend:
         self._energy_frames.pop(id(context), None)
         self._context_meshes.pop(id(context), None)
         self._contest_mesh = None
+        self._contest_step_entries.clear()
+        self._contest_adapt_entry = None
+        self._contest_energy_entries.clear()
 
     def beam_candidates(
         self,
@@ -850,31 +1066,35 @@ class DefaultEvalBackend:
             key = (int(replica_steps), int(walker_chunk_size))
             step = self._singular_step_entries.get(key)
             if step is None:
-                step = jax.jit(
-                    partial(
-                        _step_single,
-                        replica_steps=key[0],
-                        walker_chunk_size=key[1],
-                    ),
-                    in_shardings=(
-                        self._singular_state_sharding,
-                        self._singular_model_sharding,
-                        self._singular_context_sharding,
-                    ),
-                    out_shardings=self._singular_state_sharding,
-                    donate_argnums=(0,),
+                step = _build_singular_mcmc_step(
+                    self._singular_mesh,
+                    state,
+                    self._singular_state_sharding,
+                    self._singular_model_sharding,
+                    self._singular_context_sharding,
+                    replica_steps=key[0],
+                    walker_chunk_size=key[1],
                 )
                 self._singular_step_entries[key] = step
             return step(state, model, context)
         if not isinstance(model, CompiledWaveFunctions):
             raise TypeError("multirow eval MCMC requires compiled wavefunctions")
-        return _step_compiled_rows(
-            state,
-            model,
-            context,
-            replica_steps=int(replica_steps),
-            walker_chunk_size=int(walker_chunk_size),
-        )
+        mesh = self._context_meshes.get(id(context))
+        if mesh is None:
+            raise RuntimeError("contest MCMC mesh is unavailable")
+        key = (int(replica_steps), int(walker_chunk_size))
+        step = self._contest_step_entries.get(key)
+        if step is None:
+            step = _build_rows_mcmc_step(
+                mesh,
+                state,
+                model,
+                context,
+                replica_steps=key[0],
+                walker_chunk_size=key[1],
+            )
+            self._contest_step_entries[key] = step
+        return step(state, model, context)
 
     def adapt_mcmc(self, state, config: EvalMCMCConfig):
         arguments = (
@@ -885,7 +1105,23 @@ class DefaultEvalBackend:
             jnp.asarray(config.haar_target_acceptance, dtype=jnp.float32),
         )
         if state.q.ndim == 5:
-            return _adapt_rows(*arguments)
+            if self._contest_mesh is None:
+                raise RuntimeError("contest adaptation mesh is unavailable")
+            if self._contest_adapt_entry is None:
+                replicated = NamedSharding(self._contest_mesh, P())
+                state_sharding = _system_sharding(self._contest_mesh, state)
+                self._contest_adapt_entry = jax.jit(
+                    _adapt_rows,
+                    in_shardings=(
+                        state_sharding,
+                        replicated,
+                        replicated,
+                        replicated,
+                        replicated,
+                    ),
+                    out_shardings=state_sharding,
+                )
+            return self._contest_adapt_entry(*arguments)
         if self._singular_mesh is None or self._singular_state_sharding is None:
             raise RuntimeError("singular eval placement has not been prepared")
         if self._singular_adapt_entry is None:
@@ -969,12 +1205,18 @@ class DefaultEvalBackend:
         chunk_size = int(config.chunk_size)
         if isinstance(model, CompiledWaveFunctions):
             frames = self._frames(context)
-            return _compiled_energy_rows(
+            mesh = self._context_meshes.get(id(context))
+            if mesh is None:
+                raise RuntimeError("contest energy mesh is unavailable")
+            energy = self._contest_energy_entries.get(chunk_size)
+            if energy is None:
+                energy = _build_compiled_energy_rows(mesh, chunk_size)
+                self._contest_energy_entries[chunk_size] = energy
+            return energy(
                 model.kernel,
                 model.trees,
                 frames,
                 q,
-                chunk_size=chunk_size,
             )
         if not isinstance(model, CompiledWaveFunction):
             raise TypeError("singular eval energy requires a compiled wavefunction")
@@ -988,11 +1230,6 @@ class DefaultEvalBackend:
             self._singular_mesh,
             P("batch", None, None),
         )
-        energy_sharding = NamedSharding(
-            self._singular_mesh,
-            P(None, "batch"),
-        )
-        output_shardings = (energy_sharding,) * 4
         q = jax.device_put(q, q_sharding)
         frames = self._frames(context)
         frame_sharding = _replicated_sharding(
@@ -1002,26 +1239,18 @@ class DefaultEvalBackend:
         frames = jax.device_put(frames, frame_sharding)
         energy = self._singular_energy_entries.get(chunk_size)
         if energy is None:
-            energy = jax.jit(
-                partial(
-                    _compiled_energy_single,
-                    chunk_size=chunk_size,
-                ),
-                in_shardings=(
-                    self._singular_model_sharding.kernel,
-                    self._singular_model_sharding.tree,
-                    frame_sharding,
-                    q_sharding,
-                ),
-                out_shardings=output_shardings,
+            energy = _build_compiled_energy_single(
+                self._singular_mesh,
+                chunk_size,
             )
             self._singular_energy_entries[chunk_size] = energy
-        return energy(
+        outputs = energy(
             model.kernel,
             model.tree,
             frames,
             q,
         )
+        return tuple(jnp.expand_dims(value, axis=0) for value in outputs)
 
     def block_until_ready(self, value) -> None:
         jax.block_until_ready(value)

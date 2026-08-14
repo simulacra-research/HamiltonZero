@@ -338,6 +338,7 @@ def staged(
             jax.tree_util.tree_map(_spec_for, a) for a in dynamic_args
         )
         cache_key = (
+            id(instance),
             instance.pmap_axis_name,
             tuple(mesh.axis_names),
             tuple(mesh.shape.items()),

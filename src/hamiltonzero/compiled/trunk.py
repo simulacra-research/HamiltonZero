@@ -127,3 +127,31 @@ def compile_shared_trunk(model, ctx) -> SharedTrunk:
         real_mask=ctx.mask,
         balanced_mask=ctx.bmask,
     )
+
+
+def compile_shared_trunk_from_kernel(kernel: TrunkCompilerKernel, ctx) -> SharedTrunk:
+    edge_feat, local_feat, global_feat = kernel.featurizer(
+        ctx.J_double_prime,
+        ctx.mask,
+        ctx.h_prime,
+    )
+    g_seed = tree_sphere(global_feat.astype(local_feat.dtype))
+    node_raw, edge_raw, g_seed = kernel.trunk(
+        ctx,
+        edge_feat,
+        local_feat,
+        g_seed,
+    )
+    global_stream = kernel.shared_global(
+        g_seed.astype(edge_raw.dtype),
+        edge_raw,
+        ctx.mask,
+    )
+    return SharedTrunk(
+        node_raw=node_raw,
+        edge_raw=edge_raw,
+        global_raw=global_feat,
+        global_stream=global_stream,
+        real_mask=ctx.mask,
+        balanced_mask=ctx.bmask,
+    )

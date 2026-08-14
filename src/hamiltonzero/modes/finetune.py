@@ -80,21 +80,14 @@ def _burn_in(
     context,
     state: REState,
     config: FineTuneConfig,
+    step_mcmc,
+    adapt,
 ) -> REState:
-    replica_steps = config.mcmc.burn_in_replica_steps
-    step_mcmc = eqx.filter_jit(
-        functools.partial(
-            run_batched,
-            n_steps=replica_steps,
-            walker_chunk_size=config.mcmc.walker_chunk_size,
-        )
-    )
-    adapt = eqx.filter_jit(functools.partial(_adapt, config=config))
     for iteration in range(config.mcmc.burn_in):
         state = step_mcmc(
+            state,
             model,
             context,
-            state,
         )
         if iteration > 0 and iteration % config.mcmc.adapt_every == 0:
             state = adapt(state)
@@ -109,9 +102,35 @@ def _replicate(value, sharding: NamedSharding):
 
 
 def _place_state(state: REState, mesh: Mesh) -> REState:
+    return jax.device_put(state, _state_sharding(mesh))
+
+
+def _state_specs() -> REState:
+    walkers = P("batch")
+    replicated = P()
+    return REState(
+        q=walkers,
+        log_p=walkers,
+        grad_log_p=walkers,
+        beta=replicated,
+        sigma=replicated,
+        step=replicated,
+        key=walkers,
+        n_local_accept=walkers,
+        n_local=walkers,
+        n_swap_accept=walkers,
+        n_swap=walkers,
+        mask=replicated,
+        m=replicated,
+        n_haar_accept=walkers,
+        n_haar=walkers,
+    )
+
+
+def _state_sharding(mesh: Mesh) -> REState:
     replicated = NamedSharding(mesh, P())
     batched = NamedSharding(mesh, P("batch"))
-    shardings = REState(
+    return REState(
         q=batched,
         log_p=batched,
         grad_log_p=batched,
@@ -128,7 +147,83 @@ def _place_state(state: REState, mesh: Mesh) -> REState:
         n_haar_accept=batched,
         n_haar=batched,
     )
-    return jax.device_put(state, shardings)
+
+
+def _build_mcmc_entry(
+    mesh: Mesh,
+    state_sharding,
+    model_sharding,
+    context_sharding,
+    *,
+    replica_steps: int,
+    walker_chunk_size: int | None,
+):
+    specs = _state_specs()
+
+    def local_step(state, model, context):
+        out = run_batched(
+            model,
+            context,
+            state,
+            n_steps=int(replica_steps),
+            walker_chunk_size=walker_chunk_size,
+        )
+        local_count = jnp.asarray(out.q.shape[0], dtype=jnp.int32)
+        global_count = jax.lax.psum(local_count, "batch")
+        guard = global_count.astype(out.q.dtype) * jnp.asarray(0.0, out.q.dtype)
+        return eqx.tree_at(lambda value: value.q, out, out.q + guard)
+
+    mapped = jax.shard_map(
+        local_step,
+        mesh=mesh,
+        in_specs=(specs, P(), P()),
+        out_specs=specs,
+        check_vma=False,
+    )
+    return jax.jit(
+        mapped,
+        in_shardings=(state_sharding, model_sharding, context_sharding),
+        out_shardings=state_sharding,
+        donate_argnums=(0,),
+    )
+
+
+def _build_energy_entry(
+    mesh: Mesh,
+    model_sharding,
+    frame_sharding,
+    *,
+    chunk_size: int,
+):
+    q_spec = P("batch", None, None)
+    output_spec = P("batch")
+
+    def local_energy(model, frame, q):
+        outputs = vmc_energy_custom_lap_finetune(
+            model,
+            frame,
+            q,
+            chunk_size=int(chunk_size),
+        )
+        local_count = jnp.asarray(q.shape[0], dtype=jnp.int32)
+        global_count = jax.lax.psum(local_count, "batch")
+        guard = global_count.astype(jnp.float32) * jnp.asarray(0.0, jnp.float32)
+        return tuple(value + guard.astype(value.dtype) for value in outputs)
+
+    mapped = jax.shard_map(
+        local_energy,
+        mesh=mesh,
+        in_specs=(P(), P(), q_spec),
+        out_specs=(output_spec,) * 4,
+        check_vma=False,
+    )
+    q_sharding = NamedSharding(mesh, q_spec)
+    output_sharding = NamedSharding(mesh, output_spec)
+    return jax.jit(
+        mapped,
+        in_shardings=(model_sharding, frame_sharding, q_sharding),
+        out_shardings=(output_sharding,) * 4,
+    )
 
 
 def _metric(
@@ -175,10 +270,8 @@ def run_finetune(
         initial_m=config.mcmc.initial_haar_sites,
         initial_sigma=config.mcmc.initial_sigma,
     )
-    reused = False
     if config.mcmc.reuse_mcmc is not None:
         state = load_mcmc(config.mcmc.reuse_mcmc, state)
-        reused = True
     key, _route_key = jax.random.split(key)
     freeze_route = eqx.filter_jit(
         functools.partial(
@@ -222,6 +315,10 @@ def run_finetune(
         )
     mesh = Mesh(np.asarray(devices, dtype=object), ("batch",))
     replicated = NamedSharding(mesh, P())
+    state_sharding = _state_sharding(mesh)
+    model_sharding = jax.tree_util.tree_map(lambda _value: replicated, model)
+    context_sharding = jax.tree_util.tree_map(lambda _value: replicated, context)
+    frame_sharding = jax.tree_util.tree_map(lambda _value: replicated, energy_frame)
     model = _replicate(model, replicated)
     context = _replicate(context, replicated)
     energy_frame = _replicate(energy_frame, replicated)
@@ -234,6 +331,42 @@ def run_finetune(
         jnp.zeros((1, config.mcmc.batch_size), dtype=jnp.complex64),
         kfac_data,
     )
+    mcmc_entries = {}
+
+    def mcmc_entry(replica_steps: int):
+        entry_key = (int(replica_steps), config.mcmc.walker_chunk_size)
+        entry = mcmc_entries.get(entry_key)
+        if entry is None:
+            entry = _build_mcmc_entry(
+                mesh,
+                state_sharding,
+                model_sharding,
+                context_sharding,
+                replica_steps=entry_key[0],
+                walker_chunk_size=entry_key[1],
+            )
+            mcmc_entries[entry_key] = entry
+        return entry
+
+    adapt = jax.jit(
+        functools.partial(_adapt, config=config),
+        in_shardings=(state_sharding,),
+        out_shardings=state_sharding,
+    )
+    local_energy = _build_energy_entry(
+        mesh,
+        model_sharding,
+        frame_sharding,
+        chunk_size=config.energy.chunk_size,
+    )
+    target_entry = jax.jit(
+        functools.partial(
+            process_finetune_targets,
+            mad_width=config.kfac.mad_clip_width,
+        ),
+        in_shardings=(kfac_data, replicated),
+        out_shardings=kfac_data,
+    )
     kfac = init_finetune_kfac_state(
         config.kfac,
         model,
@@ -244,30 +377,23 @@ def run_finetune(
         key=jax.random.fold_in(key, 0xCAFE),
         multi_device=mesh.size > 1,
     )
-    if not reused:
-        state = _burn_in(model, context, state, config)
-    step_mcmc = eqx.filter_jit(
-        functools.partial(
-            run_batched,
-            n_steps=config.mcmc.steps,
-            walker_chunk_size=config.mcmc.walker_chunk_size,
-        )
+    state = _burn_in(
+        model,
+        context,
+        state,
+        config,
+        mcmc_entry(config.mcmc.burn_in_replica_steps),
+        adapt,
     )
-    adapt = eqx.filter_jit(functools.partial(_adapt, config=config))
-    local_energy = eqx.filter_jit(
-        functools.partial(
-            vmc_energy_custom_lap_finetune,
-            chunk_size=config.energy.chunk_size,
-        )
-    )
+    step_mcmc = mcmc_entry(config.mcmc.steps)
     run_started = time.perf_counter()
     last_metric = None
     for step in range(config.steps):
         step_started = time.perf_counter()
         state = step_mcmc(
+            state,
             model,
             context,
-            state,
         )
         if step > 0 and step % config.mcmc.adapt_every == 0:
             state = adapt(state)
@@ -277,10 +403,9 @@ def run_finetune(
             energy_frame,
             q_cold,
         )
-        target = process_finetune_targets(
+        target = target_entry(
             total[None],
             context_batch.s_norm,
-            mad_width=config.kfac.mad_clip_width,
         )
         key, key_kfac = jax.random.split(key)
         model, kfac = apply_finetune_kfac_step(
