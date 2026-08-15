@@ -23,7 +23,7 @@ dependencies = [
     "dm-tree>=0.1.10",
     "equinox==0.13.6",
     "immutabledict>=4.3",
-    "jax @ git+https://github.com/TakeOver/jax.git@79f82535b15a444516d4a5e2beb71d283665b2ff",
+    "jax==0.11.0",
     "jaxlib==0.11.0",
     "jaxtyping==0.3.9",
     "networkx>=3.5",

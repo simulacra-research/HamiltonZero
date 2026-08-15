@@ -16,13 +16,8 @@ HamiltonZero requires Python 3.12 and JAX-compatible accelerator drivers.
 python -m pip install .
 ```
 
-The package pins the Python `jax` package to a
-[`TakeOver/jax` commit](https://github.com/TakeOver/jax/commit/79f82535b15a444516d4a5e2beb71d283665b2ff),
-also published as `hamiltonzero-jax-v0.11.0-spin.1`, and pins
-`jaxlib==0.11.0`. The fork contains the symbolic-zero JVP support used by the
-tuned Pallas attention kernel; stock Python JAX 0.11.0 is not sufficient for
-that pathway. Install the accelerator plugin appropriate for the host using
-the standard JAX instructions.
+The package pins `jax==0.11.0` and `jaxlib==0.11.0`. Install the accelerator
+plugin appropriate for the host using the standard JAX instructions.
 
 Learned-router training uses eight visible accelerators and requires an MCMC
 batch size divisible by eight. Fine-tuning uses all visible accelerators and
