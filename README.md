@@ -10,11 +10,20 @@ wavefunctions of quantum spin Hamiltonians. It exposes three workflows:
 
 ## Installation
 
-HamiltonZero requires Python 3.12 and JAX-compatible accelerator drivers.
+HamiltonZero requires Python 3.12 or newer and JAX-compatible accelerator
+drivers.
 
 ```bash
-python -m pip install .
+python -m pip install hamiltonzero
 ```
+
+To install from a source checkout instead, run `python -m pip install .` in
+the repository root.
+
+Example configurations and research datasets are repository assets rather
+than wheel data. Clone the matching
+[`v0.1.1` source tree](https://github.com/simulacra-research/HamiltonZero/tree/v0.1.1)
+to run the documented commands unchanged.
 
 The package pins `jax==0.11.0` and `jaxlib==0.11.0`. Install the accelerator
 plugin appropriate for the host using the standard JAX instructions.
@@ -66,10 +75,9 @@ does this from the input system automatically.
 
 The public API follows the textbook convention
 
-\[
-H = \sum_{i<j} S_i^T J_{ij} S_j + \sum_i h_i^T S_i,
-\qquad S=\sigma/2.
-\]
+```text
+H = sum_(i<j) S_i^T J_ij S_j + sum_i h_i^T S_i,  S = sigma/2.
+```
 
 Construct and save a system from a simple undirected NetworkX graph:
 
@@ -148,8 +156,8 @@ There is no additional bit reversal: applying one would corrupt the mapping.
 Both arrays include padded virtual leaves when the model width exceeds the
 physical site count. A complete runnable version that prints sample means and
 standard deviations is in
-[`examples/compiled_inference.py`](examples/compiled_inference.py).
-[`examples/j1j2_4x4_route.ipynb`](examples/j1j2_4x4_route.ipynb) constructs a
+[`examples/compiled_inference.py`](https://github.com/simulacra-research/HamiltonZero/blob/v0.1.1/examples/compiled_inference.py).
+[`examples/j1j2_4x4_route.ipynb`](https://github.com/simulacra-research/HamiltonZero/blob/v0.1.1/examples/j1j2_4x4_route.ipynb) constructs a
 periodic 4-by-4 J1-J2 model from NetworkX and visualizes the returned order as
 the successive cells of the compiled binary merge tree. Install its plotting
 dependencies with `python -m pip install '.[notebooks]'`.
@@ -201,7 +209,7 @@ public textbook units above.
   spins.
 
 Large-N files store physical sites only; the loader reconstructs power-of-two
-padding in memory. See [`datasets/README.md`](datasets/README.md) for the full
+padding in memory. See [`datasets/README.md`](https://github.com/simulacra-research/HamiltonZero/blob/v0.1.1/datasets/README.md) for the full
 inventory and sparse exchange encoding.
 
 ## Train
@@ -298,4 +306,4 @@ licensed under Apache-2.0, copyright Simulacra Research Inc. The vendored
 KFAC-JAX fork and JAX-derived large-N attention kernel remain under
 Apache-2.0. The Microsoft-Folx-derived attention forward and reverse-mode
 kernels remain under MIT. See
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+[`THIRD_PARTY_NOTICES.md`](https://github.com/simulacra-research/HamiltonZero/blob/v0.1.1/THIRD_PARTY_NOTICES.md).

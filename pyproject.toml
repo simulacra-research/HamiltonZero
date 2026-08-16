@@ -4,10 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hamiltonzero"
-version = "0.1.0"
+version = "0.1.1"
 description = "Compiled neural wavefunctions for quantum spin systems"
 readme = "README.md"
 requires-python = ">=3.12"
+authors = [
+    {name = "Simulacra Research Inc."},
+]
+keywords = [
+    "neural quantum states",
+    "quantum many-body physics",
+    "quantum Monte Carlo",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 license = "Apache-2.0 AND MIT"
 license-files = [
     "LICENSE",
@@ -32,6 +47,12 @@ dependencies = [
     "packaging>=26",
     "typing-extensions>=4.15",
 ]
+
+[project.urls]
+Homepage = "https://github.com/simulacra-research/HamiltonZero"
+Repository = "https://github.com/simulacra-research/HamiltonZero"
+Issues = "https://github.com/simulacra-research/HamiltonZero/issues"
+"Model weights" = "https://huggingface.co/simulacra-research/HamiltonZero"
 
 [project.optional-dependencies]
 notebooks = [
