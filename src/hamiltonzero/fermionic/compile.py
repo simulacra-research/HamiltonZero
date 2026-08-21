@@ -28,6 +28,7 @@ class CompiledSector:
     reference_energy: float
     sector: Sector
     checks: dict = field(default_factory=dict)
+    projection: np.ndarray | None = None
 
     @property
     def raw_model_reference(self) -> float:
@@ -78,8 +79,9 @@ def compile_fermionic_sector(
     sector, block = ground_sector(matrix, n_modes, n_electrons)
     reference = float(np.linalg.eigvalsh(block)[0])
 
+    projection = None
     if spin is not None:
-        _, block = spin_resolve(matrix, sector, n_modes, spin=spin)
+        projection, block = spin_resolve(matrix, sector, n_modes, spin=spin)
         resolved = float(np.linalg.eigvalsh(block)[0])
         if abs(resolved - reference) > 1e-9:
             raise ValueError(
@@ -115,4 +117,5 @@ def compile_fermionic_sector(
         reference_energy=reference,
         sector=sector,
         checks=checks,
+        projection=projection,
     )

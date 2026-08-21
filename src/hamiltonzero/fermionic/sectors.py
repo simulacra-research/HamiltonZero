@@ -85,6 +85,8 @@ def ground_sector(
 
 
 def s2_matrix(n_modes: int) -> np.ndarray:
+    if n_modes % 2:
+        raise ValueError("spin operators require an even number of modes")
     dimension = 1 << n_modes
     s_plus = np.zeros((dimension, dimension))
     for orbital in range(n_modes // 2):
@@ -109,6 +111,8 @@ def spin_resolve(
     spin: float = 0.0,
     tolerance: float = 1e-8,
 ) -> tuple[np.ndarray, np.ndarray]:
+    if spin < 0 or abs(2 * spin - round(2 * spin)) > 1e-12:
+        raise ValueError("spin must be a nonnegative integer or half-integer")
     states = list(sector.fock_states)
     block = matrix[np.ix_(states, states)]
     s2_block = s2_matrix(n_modes)[np.ix_(states, states)]

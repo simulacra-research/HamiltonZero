@@ -1,14 +1,36 @@
 {
   "molecule": "H2O",
+  "point_group": "C2v",
+  "charge": 0,
+  "multiplicity": 1,
+  "geometry": "O 0 0 0; H 0.7586 0 0.5043; H -0.7586 0 0.5043",
+  "geometry_units": "angstrom",
   "basis": "STO-3G",
-  "method": "RHF + CASCI",
+  "scf_method": "RHF",
+  "scf_energy_hartree": -74.9458851008,
+  "full_spatial_orbitals": 7,
+  "full_electrons": 10,
+  "frozen_core_spatial_orbitals": [
+    0,
+    1,
+    2,
+    3
+  ],
   "active_space": "CAS(2e,2o)",
   "active_spatial_orbitals": [
     4,
     5
   ],
-  "geometry": "O 0 0 0; H 0.7586 0 0.5043; H -0.7586 0 0.5043",
-  "geometry_units": "angstrom",
+  "active_orbital_rotation": {
+    "pair": [
+      0,
+      1
+    ],
+    "angle_radians": 0.4487989505128276,
+    "note": "pi/7 Givens rotation applied to the two canonical CASCI active orbitals before the integral transform; deliberate gauge choice, since canonical-gauge CAS(2e,2o) integrals leave several fermion-qubit frames trivially sparse and the rotation keeps the example's compilation non-degenerate"
+  },
+  "integral_generator": "PySCF RHF + OpenFermion spin-orbital InteractionOperator transform",
+  "reference_solver": "CASCI via fixed-particle-number exact diagonalization",
   "units": "hartree",
   "convention": "two_body[p,q,r,s] multiplies a+_p a+_q a_r a_s; spin orbitals interleave alpha on even indices, p = 2P + sigma",
   "constant": -73.2893295255,

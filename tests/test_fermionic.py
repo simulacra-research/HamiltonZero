@@ -14,6 +14,7 @@ from hamiltonzero.fermionic import (
     compile_fermionic_sector,
     exact_reference,
     fock_matrix,
+    s2_matrix,
     sector_dimension,
     spinorb_from_spatial,
     total_number_states,
@@ -124,8 +125,33 @@ def test_traceless_binary_block():
 
 def test_spin_request_failure_raises():
     one, two, constant = h2o_case()
-    with pytest.raises(ValueError, match="no S=0.7 component"):
-        compile_fermionic_sector(one, two, constant, 2, spin=0.7)
+    with pytest.raises(ValueError, match="no S=2.0 component"):
+        compile_fermionic_sector(one, two, constant, 2, spin=2.0)
+
+
+def test_invalid_spin_rejected():
+    one, two, constant = h2o_case()
+    for bad in (-1.0, 0.3):
+        with pytest.raises(ValueError, match="half-integer"):
+            compile_fermionic_sector(one, two, constant, 2, spin=bad)
+
+
+def test_odd_mode_spin_operators_rejected():
+    with pytest.raises(ValueError, match="even number of modes"):
+        s2_matrix(3)
+
+
+def test_spin_projection_recorded():
+    one, two, constant = h2o_case()
+    compiled = compile_fermionic_sector(one, two, constant, 2, spin=0.0)
+    matrix = fock_matrix(one, two, constant)
+    states = list(compiled.sector.fock_states)
+    block = matrix[np.ix_(states, states)]
+    assert compiled.projection.shape == (4, 3)
+    projected = compiled.projection.T @ block @ compiled.projection
+    assert abs(
+        float(np.linalg.eigvalsh(projected)[0]) - compiled.reference_energy
+    ) < 1e-9
 
 
 def test_odd_electron_sector_dimension():
